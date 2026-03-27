@@ -10,7 +10,7 @@ import path from "path";
 import fs from "fs";
 
 // Simple in-memory token store (ganti dengan database/session untuk production)
-const tokenStore = new Map<string, { access_token: string; refresh_token?: string }>();
+// const tokenStore = new Map<string, { access_token: string; refresh_token?: string }>();
 const isBrowserRequest = (request: Request): boolean => {
   const origin = request.headers.get("origin");
   const referer = request.headers.get("referer");
@@ -89,10 +89,14 @@ const app = new Elysia()
 
     // Simpan token dengan session ID sederhana
     const sessionId = crypto.randomUUID();
-    tokenStore.set(sessionId, {
-      access_token: tokens.access_token!,
-      refresh_token: tokens.refresh_token ?? undefined,
+    await prisma.session.create({
+      data: {
+        id: sessionId,
+        accessToken: tokens.access_token!,
+        refreshToken: tokens.refresh_token ?? undefined,
+      },
     });
+
     if (!session) return;
 
     // Set cookie session
@@ -101,26 +105,31 @@ const app = new Elysia()
     session.httpOnly = true;
     session.secure = true; 
     session.sameSite = "none";
+
     // !!! ubah url frontend jadi dynamic ambil dari env (lakukan ke semua file di apps/backend), contoh:
     return redirect(`${process.env.FRONTEND_URL}/classroom`);
   })
 
   // Cek status login
-  .get("/auth/me", ({ cookie: { session } }) => {
+  .get("/auth/me", async ({ cookie: { session } }) => {
     const sessionId = session?.value as string;
-    if (!sessionId || !tokenStore.has(sessionId)) {
-      return { loggedIn: false };
-    }
-    return { loggedIn: true, sessionId };
+   if (!sessionId) return { loggedIn: false };
+
+    const dbSession = await prisma.session.findUnique({ where: { id: sessionId } });
+    return { loggedIn: !!dbSession };
   })
 
   // Logout
-  .post("/auth/logout", ({ cookie: { session } }) => {
+  .post("/auth/logout", async ({ cookie: { session } }) => {
     if(!session) return { success: false };
 
     const sessionId = session?.value as string;
     if (sessionId) {
-      tokenStore.delete(sessionId);
+      try {
+        await prisma.session.delete({ where: { id: sessionId } });
+      } catch (e) {
+        // Abaikan jika session tidak ditemukan
+      }
       session.remove();
     }
     return { success: true };
@@ -131,23 +140,23 @@ const app = new Elysia()
   // Ambil daftar courses mahasiswa
   .get("/classroom/courses", async ({ cookie: { session }, set }) => {
     const sessionId = session?.value as string;
-    const tokens = sessionId ? tokenStore.get(sessionId) : null;
+    const dbSession = sessionId ? await prisma.session.findUnique({ where: { id: sessionId } }) : null;
 
-    if (!tokens) {
+    if (!dbSession) {
       set.status = 401;
       return { error: "Unauthorized. Silakan login terlebih dahulu." };
     }
 
-    const courses = await getCourses(tokens.access_token);
+    const courses = await getCourses(dbSession.accessToken);
     return { data: courses, message: "Courses retrieved" };
   })
 
   // Ambil coursework + submisi untuk satu course
   .get("/classroom/courses/:courseId/submissions", async ({ params, cookie: { session }, set }) => {
     const sessionId = session?.value as string;
-    const tokens = sessionId ? tokenStore.get(sessionId) : null;
+    const dbSession = sessionId ? await prisma.session.findUnique({ where: { id: sessionId } }) : null;
 
-    if (!tokens) {
+    if (!dbSession) {
       set.status = 401;
       return { error: "Unauthorized. Silakan login terlebih dahulu." };
     }
@@ -155,8 +164,8 @@ const app = new Elysia()
     const { courseId } = params;
 
     const [courseWorks, submissions] = await Promise.all([
-      getCourseWorks(tokens.access_token, courseId),
-      getSubmissions(tokens.access_token, courseId),
+      getCourseWorks(dbSession.accessToken, courseId),
+      getSubmissions(dbSession.accessToken, courseId),
     ]);
 
     // Gabungkan coursework dengan submisi
